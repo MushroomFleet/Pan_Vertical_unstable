@@ -6,5 +6,6 @@
     "markpoint3": 90.0,
     "overlay": "none",
     "batch_size": 8,
-    "gpu_memory_allocation": 0.7
+    "gpu_memory_allocation": 0.7,
+    "pipeline_queue_size": 60
 }
