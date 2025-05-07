@@ -1,0 +1,10 @@
+{
+    "source": "/path/to/videos/",
+    "output": "/path/to/output/",
+    "markpoint1": 5.0,
+    "markpoint2": 50.0,
+    "markpoint3": 90.0,
+    "overlay": "none",
+    "batch_size": 8,
+    "gpu_memory_allocation": 0.7
+}
