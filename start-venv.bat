@@ -11,7 +11,7 @@ echo.
 echo Running video panner test...
 echo Command: python video_panner.py --config test-overlay.json --verbose --check-first-frame
 echo.
-python video_panner.py --config test.json --verbose --check-first-frame
+python video_panner.py --config test-overlay.json --verbose --check-first-frame
 
 echo.
 echo ===================================

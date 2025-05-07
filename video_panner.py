@@ -203,69 +203,88 @@ class FrameProcessorThread(threading.Thread):
                     
                     if CUDA_AVAILABLE:
                         try:
-                            # GPU-accelerated alpha blending
-                            gpu_overlay = cp.asarray(resized_overlay)
-                            gpu_area = cp.asarray(overlay_area)
+                            # GPU-accelerated alpha blending - fully vectorized approach
+                            gpu_overlay = to_gpu(resized_overlay)
+                            gpu_area = to_gpu(overlay_area)
                             
-                            # Alpha blending formula on GPU
+                            # Get alpha channel and reshape for broadcasting
                             alpha_factor = gpu_overlay[:,:,3].astype(cp.float32) / 255.0
+                            alpha_factor = alpha_factor[:,:,cp.newaxis]  # Add channel dimension for broadcasting
                             
-                            # Create the result array on GPU
-                            blended_gpu = cp.zeros_like(gpu_area)
-                            
-                            # Apply blending for each channel
-                            for c in range(3):
-                                blended_gpu[:,:,c] = (gpu_area[:,:,c] * (1 - alpha_factor) + 
-                                                  gpu_overlay[:,:,c] * alpha_factor).astype(cp.uint8)
+                            # Vectorized alpha blending for all channels at once
+                            # This eliminates the need to loop through each channel separately
+                            blended_gpu = (gpu_area * (1 - alpha_factor) + 
+                                          gpu_overlay[:,:,:3] * alpha_factor).astype(cp.uint8)
                             
                             # Transfer back to CPU
-                            blended_area = cp.asnumpy(blended_gpu)
+                            blended_area = to_cpu(blended_gpu)
                             
                             # Copy the blended result back to the portrait frame
                             portrait_frame[y_pos:y_pos+h, x_pos:x_pos+w] = blended_area
                         except Exception:
-                            # CPU fallback implementation
+                            # CPU fallback with vectorized implementation
                             blended_area = overlay_area.copy()
+                            
+                            # Reshape alpha for broadcasting across channels - vectorized approach
                             alpha_factor = resized_overlay[:,:,3].astype(float) / 255.0
-                            for c in range(3):
-                                blended_area[:,:,c] = (overlay_area[:,:,c] * (1 - alpha_factor) + 
-                                                   resized_overlay[:,:,c] * alpha_factor).astype(np.uint8)
+                            alpha_factor = alpha_factor[:,:,np.newaxis]  # Add channel dimension
+                            
+                            # Vectorized operation across all channels at once
+                            blended_area = (overlay_area * (1 - alpha_factor) + 
+                                           resized_overlay[:,:,:3] * alpha_factor).astype(np.uint8)
+                            
                             portrait_frame[y_pos:y_pos+h, x_pos:x_pos+w] = blended_area
                     else:
-                        # CPU implementation
-                        blended_area = overlay_area.copy()
+                        # CPU vectorized implementation
+                        # Reshape alpha for broadcasting - eliminates channel loops
                         alpha_factor = resized_overlay[:,:,3].astype(float) / 255.0
-                        for c in range(3):
-                            blended_area[:,:,c] = (overlay_area[:,:,c] * (1 - alpha_factor) + 
-                                               resized_overlay[:,:,c] * alpha_factor).astype(np.uint8)
-                        portrait_frame[y_pos:y_pos+h, x_pos:x_pos+w] = blended_area
+                        alpha_factor = alpha_factor[:,:,np.newaxis]  # Add channel dimension
+                        
+                        # Vectorized alpha blending for all channels at once
+                        portrait_frame[y_pos:y_pos+h, x_pos:x_pos+w] = (
+                            overlay_area * (1 - alpha_factor) + 
+                            resized_overlay[:,:,:3] * alpha_factor
+                        ).astype(np.uint8)
                 else:
                     # For non-transparent overlays
-                    if CUDA_AVAILABLE:
-                        try:
-                            # Use CUDA-accelerated addWeighted
-                            gpu_overlay_area = to_gpu(portrait_frame[y_pos:y_pos+h, x_pos:x_pos+w])
-                            gpu_overlay_img = to_gpu(resized_overlay)
-                            
-                            # Perform blending on GPU
-                            gpu_result = cuda.addWeighted(gpu_overlay_area, 0.7, gpu_overlay_img, 0.3, 0.0)
-                            
-                            # Transfer result back to CPU and place in the portrait frame
-                            portrait_frame[y_pos:y_pos+h, x_pos:x_pos+w] = to_cpu(gpu_result)
-                        except Exception:
-                            # Fallback to CPU
+                        if CUDA_AVAILABLE:
+                            try:
+                                # Use more efficient CUDA implementation for blending
+                                if cupy_cuda_available:
+                                    # Use CuPy for faster blending (avoids OpenCV overhead)
+                                    gpu_overlay_area = to_gpu(portrait_frame[y_pos:y_pos+h, x_pos:x_pos+w])
+                                    gpu_overlay_img = to_gpu(resized_overlay)
+                                    
+                                    # Faster direct calculation - avoids transfer overhead of OpenCV CUDA
+                                    # Implements alpha blending for non-transparent overlay: dst = src1*alpha + src2*beta + gamma
+                                    blended = (gpu_overlay_area * 0.7 + gpu_overlay_img * 0.3).astype(cp.uint8)
+                                    
+                                    # Update the portrait frame with blended result
+                                    portrait_frame[y_pos:y_pos+h, x_pos:x_pos+w] = to_cpu(blended)
+                                elif opencv_cuda_available:
+                                    # OpenCV CUDA fallback
+                                    gpu_overlay_area = to_gpu(portrait_frame[y_pos:y_pos+h, x_pos:x_pos+w])
+                                    gpu_overlay_img = to_gpu(resized_overlay)
+                                    
+                                    # Perform blending on GPU
+                                    gpu_result = cuda.addWeighted(gpu_overlay_area, 0.7, gpu_overlay_img, 0.3, 0.0)
+                                    
+                                    # Transfer result back to CPU and place in the portrait frame
+                                    portrait_frame[y_pos:y_pos+h, x_pos:x_pos+w] = to_cpu(gpu_result)
+                            except Exception:
+                                # Fallback to CPU
+                                cv2.addWeighted(
+                                    portrait_frame[y_pos:y_pos+h, x_pos:x_pos+w], 0.7,
+                                    resized_overlay, 0.3, 0,
+                                    dst=portrait_frame[y_pos:y_pos+h, x_pos:x_pos+w]
+                                )
+                        else:
+                            # CPU version
                             cv2.addWeighted(
                                 portrait_frame[y_pos:y_pos+h, x_pos:x_pos+w], 0.7,
                                 resized_overlay, 0.3, 0,
                                 dst=portrait_frame[y_pos:y_pos+h, x_pos:x_pos+w]
                             )
-                    else:
-                        # CPU version
-                        cv2.addWeighted(
-                            portrait_frame[y_pos:y_pos+h, x_pos:x_pos+w], 0.7,
-                            resized_overlay, 0.3, 0,
-                            dst=portrait_frame[y_pos:y_pos+h, x_pos:x_pos+w]
-                        )
             
             return portrait_frame
             
@@ -462,6 +481,77 @@ EXPECTED_HEIGHT = 720
 OUTPUT_WIDTH = 720
 OUTPUT_HEIGHT = 1280
 
+# Create lookup tables for common color transformations
+def create_alpha_blend_lut(max_alpha=256):
+    """Create a lookup table for alpha blending factors.
+    
+    This pre-computes all possible alpha values and their complements
+    to avoid redundant calculations during blending operations.
+    
+    Returns:
+        tuple: (alpha_values, complement_values) as numpy arrays
+    """
+    # Create normalized alpha values [0.0, 1.0]
+    alpha_values = np.arange(max_alpha, dtype=np.float32) / 255.0
+    
+    # Create complement values (1 - alpha)
+    complement_values = 1.0 - alpha_values
+    
+    return alpha_values, complement_values
+
+# Create vectorized x_offset calculator for more efficient processing
+def calculate_x_offsets(total_frames, markpoint1_frame, markpoint2_frame, markpoint3_frame, width):
+    """Calculate all x_offsets for a video using vectorized operations.
+    
+    Args:
+        total_frames (int): Total number of frames in the video
+        markpoint1_frame (int): Frame index for first markpoint (left alignment)
+        markpoint2_frame (int): Frame index for second markpoint (center alignment)
+        markpoint3_frame (int): Frame index for third markpoint (right alignment)
+        width (int): Width of the source video
+        
+    Returns:
+        numpy.ndarray: Array of x_offset values for each frame
+    """
+    # Create frame indices array for vectorized calculations
+    frame_indices = np.arange(total_frames)
+    
+    # Pre-allocate result array
+    x_offsets = np.zeros(total_frames, dtype=np.int32)
+    
+    # Calculate masks for different segments (more efficient than if/else)
+    mask1 = frame_indices < markpoint1_frame
+    mask2 = (frame_indices >= markpoint1_frame) & (frame_indices < markpoint2_frame)
+    mask3 = (frame_indices >= markpoint2_frame) & (frame_indices < markpoint3_frame)
+    mask4 = frame_indices >= markpoint3_frame
+    
+    # Segment 1: Before markpoint1 (left-aligned) - already zeros, no operation needed
+    
+    # Segment 2: From left to center
+    if np.any(mask2):
+        progress = (frame_indices[mask2] - markpoint1_frame) / max(1, (markpoint2_frame - markpoint1_frame))
+        max_offset = (width - OUTPUT_WIDTH) / 2  # Center position
+        x_offsets[mask2] = (progress * max_offset).astype(np.int32)
+    
+    # Segment 3: From center to right
+    if np.any(mask3):
+        progress = (frame_indices[mask3] - markpoint2_frame) / max(1, (markpoint3_frame - markpoint2_frame))
+        start_offset = (width - OUTPUT_WIDTH) / 2  # Center position
+        end_offset = width - OUTPUT_WIDTH  # Right-aligned position
+        x_offsets[mask3] = (start_offset + progress * (end_offset - start_offset)).astype(np.int32)
+    
+    # Segment 4: After markpoint3 (right-aligned)
+    if np.any(mask4):
+        x_offsets[mask4] = width - OUTPUT_WIDTH
+    
+    # Ensure all offsets are within bounds (vectorized min/max)
+    x_offsets = np.clip(x_offsets, 0, width - OUTPUT_WIDTH)
+    
+    return x_offsets
+
+# Precomputed lookup tables available globally to avoid recalculation
+ALPHA_LUT, ALPHA_COMPLEMENT_LUT = create_alpha_blend_lut()
+
 # GPU helper functions using CuPy and OpenCV for fallback
 def to_gpu(img):
     """Transfer an image to the GPU using CuPy or OpenCV"""
@@ -469,11 +559,17 @@ def to_gpu(img):
         return img
     
     try:
-        # Try CuPy first
+        # Try CuPy first - handle both single images and batch arrays
         if cupy_cuda_available:
+            # Check if the input is already a CuPy array
+            if isinstance(img, cp.ndarray):
+                return img
             return cp.asarray(img)
         # Fallback to OpenCV CUDA if available
         elif opencv_cuda_available:
+            # Check if the input is already a GpuMat
+            if isinstance(img, cuda.GpuMat):
+                return img
             return cuda.GpuMat(img)
     except Exception as e:
         print(f"GPU transfer failed: {str(e)}. Using CPU fallback.")
@@ -488,6 +584,10 @@ def to_cpu(gpu_mat):
     try:
         # Check for CuPy array
         if cupy_cuda_available and isinstance(gpu_mat, cp.ndarray):
+            # For large arrays, use pinned memory for faster host <-> device transfers
+            if USE_ADVANCED_FEATURES and gpu_mat.size > 1_000_000:
+                with cp.cuda.stream.Stream() as stream:
+                    return cp.asnumpy(gpu_mat, stream=stream)
             return cp.asnumpy(gpu_mat)
         # Check for OpenCV CUDA GpuMat
         elif opencv_cuda_available and isinstance(gpu_mat, cuda.GpuMat):
@@ -503,7 +603,7 @@ def gpu_resize(img, size):
         return cv2.resize(img, size)
     
     try:
-        # CuPy resize using scipy.ndimage
+        # CuPy resize using scipy.ndimage - vectorized for all channels at once
         if cupy_cuda_available:
             # Convert OpenCV size format (width, height) to numpy/cupy format (height, width)
             target_height, target_width = size[1], size[0]
@@ -518,14 +618,23 @@ def gpu_resize(img, size):
             h_scale = target_height / gpu_img.shape[0]
             w_scale = target_width / gpu_img.shape[1]
             
-            # Perform the resize for each channel separately
-            channels = []
-            for c in range(gpu_img.shape[2]):
-                channel = cupyx.scipy.ndimage.zoom(gpu_img[:,:,c], (h_scale, w_scale), order=1)
-                channels.append(channel)
+            # Vectorized resize approach - resize all channels at once instead of looping
+            # This is significantly faster for multi-channel images
+            if gpu_img.ndim == 3:  # Multi-channel image
+                # Use order=1 for bilinear interpolation (good balance of quality/speed)
+                scale_factors = (h_scale, w_scale, 1.0)  # No scaling for channel dimension
+                resized = cupyx.scipy.ndimage.zoom(gpu_img, scale_factors, order=1)
+                
+                # Ensure output has the exact target dimensions (zoom can be off by 1 pixel)
+                if resized.shape[0] != target_height or resized.shape[1] != target_width:
+                    resized = resized[:target_height, :target_width, :]
+            else:  # Single channel image
+                resized = cupyx.scipy.ndimage.zoom(gpu_img, (h_scale, w_scale), order=1)
+                
+                # Ensure output has the exact target dimensions
+                if resized.shape[0] != target_height or resized.shape[1] != target_width:
+                    resized = resized[:target_height, :target_width]
             
-            # Stack channels back together
-            resized = cp.stack(channels, axis=2)
             return resized
         
         # OpenCV CUDA resize fallback
@@ -548,13 +657,21 @@ def gpu_crop(img, x, y, width, height):
         return img[y:y+height, x:x+width, :]
     
     try:
-        # CuPy crop
+        # CuPy crop - optimized by skipping unnecessary data transfers
         if cupy_cuda_available:
             if not isinstance(img, cp.ndarray):
                 gpu_img = cp.asarray(img)
             else:
                 gpu_img = img
-            return gpu_img[y:y+height, x:x+width, :]
+                
+            # More efficient cropping by directly selecting region of interest
+            # This avoids unnecessary memory copies
+            if gpu_img.ndim == 3:  # Multi-channel image
+                cropped = gpu_img[y:y+height, x:x+width, :]
+            else:  # Single channel image
+                cropped = gpu_img[y:y+height, x:x+width]
+                
+            return cropped
         
         # OpenCV CUDA crop fallback
         elif opencv_cuda_available:
@@ -562,7 +679,10 @@ def gpu_crop(img, x, y, width, height):
                 gpu_img = cuda.GpuMat(img)
             else:
                 gpu_img = img
-            return gpu_img[y:y+height, x:x+width]
+                
+            # Use ROI (region of interest) for more efficient cropping
+            roi = cuda.Rect(x, y, width, height)
+            return gpu_img(roi)
     except Exception as e:
         print(f"GPU crop failed: {str(e)}. Using CPU fallback.")
     
@@ -752,29 +872,15 @@ def process_video_pipeline(config, verbose=False):
         markpoint2_frame = int(total_frames * markpoint2)
         markpoint3_frame = int(total_frames * markpoint3)
         
-        # Pre-calculate all x_offsets to avoid redundant calculations
-        x_offsets = np.zeros(total_frames, dtype=np.int32)
-        for frame_idx in range(total_frames):
-            if frame_idx < markpoint1_frame:
-                # Before markpoint1: left-aligned
-                x_offsets[frame_idx] = 0
-            elif frame_idx < markpoint2_frame:
-                # Between markpoint1 and markpoint2: animate from left to center
-                progress = (frame_idx - markpoint1_frame) / max(1, (markpoint2_frame - markpoint1_frame))
-                max_offset = (width - OUTPUT_WIDTH) / 2  # Center position
-                x_offsets[frame_idx] = int(progress * max_offset)
-            elif frame_idx < markpoint3_frame:
-                # Between markpoint2 and markpoint3: animate from center to right
-                progress = (frame_idx - markpoint2_frame) / max(1, (markpoint3_frame - markpoint2_frame))
-                start_offset = (width - OUTPUT_WIDTH) / 2  # Center position
-                end_offset = width - OUTPUT_WIDTH  # Right-aligned position
-                x_offsets[frame_idx] = int(start_offset + (progress * (end_offset - start_offset)))
-            else:
-                # After markpoint3: right-aligned
-                x_offsets[frame_idx] = width - OUTPUT_WIDTH
-            
-            # Ensure x_offset is within bounds
-            x_offsets[frame_idx] = max(0, min(width - OUTPUT_WIDTH, x_offsets[frame_idx]))
+        # Pre-calculate all x_offsets using the vectorized function
+        # This is significantly faster than the loop-based approach
+        x_offsets = calculate_x_offsets(
+            total_frames, 
+            markpoint1_frame, 
+            markpoint2_frame, 
+            markpoint3_frame, 
+            width
+        )
         
         # Create output path with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1025,28 +1131,14 @@ def process_video(config, verbose=False):
         # Prepare array of x_offsets for the entire video
         x_offsets = np.zeros(total_frames, dtype=np.int32)
         
-        # Pre-calculate all x_offsets to avoid redundant calculations
-        for frame_idx in range(total_frames):
-            if frame_idx < markpoint1_frame:
-                # Before markpoint1: left-aligned
-                x_offsets[frame_idx] = 0
-            elif frame_idx < markpoint2_frame:
-                # Between markpoint1 and markpoint2: animate from left to center
-                progress = (frame_idx - markpoint1_frame) / max(1, (markpoint2_frame - markpoint1_frame))
-                max_offset = (width - OUTPUT_WIDTH) / 2  # Center position
-                x_offsets[frame_idx] = int(progress * max_offset)
-            elif frame_idx < markpoint3_frame:
-                # Between markpoint2 and markpoint3: animate from center to right
-                progress = (frame_idx - markpoint2_frame) / max(1, (markpoint3_frame - markpoint2_frame))
-                start_offset = (width - OUTPUT_WIDTH) / 2  # Center position
-                end_offset = width - OUTPUT_WIDTH  # Right-aligned position
-                x_offsets[frame_idx] = int(start_offset + (progress * (end_offset - start_offset)))
-            else:
-                # After markpoint3: right-aligned
-                x_offsets[frame_idx] = width - OUTPUT_WIDTH
-            
-            # Ensure x_offset is within bounds
-            x_offsets[frame_idx] = max(0, min(width - OUTPUT_WIDTH, x_offsets[frame_idx]))
+        # Pre-calculate all x_offsets using the vectorized function
+        x_offsets = calculate_x_offsets(
+            total_frames, 
+            markpoint1_frame, 
+            markpoint2_frame, 
+            markpoint3_frame, 
+            width
+        )
         
         while True:
             ret, frame = cap.read()
@@ -1158,24 +1250,37 @@ def process_video(config, verbose=False):
                         
                         if CUDA_AVAILABLE:
                             try:
-                                # GPU-accelerated alpha blending
-                                # Create arrays on GPU
-                                gpu_overlay = cp.asarray(resized_overlay)
-                                gpu_area = cp.asarray(overlay_area)
+                                # GPU-accelerated alpha blending with vectorized approach and pre-computed alpha values
+                                gpu_overlay = to_gpu(resized_overlay)
+                                gpu_area = to_gpu(overlay_area)
                                 
-                                # Alpha blending formula on GPU
-                                alpha_factor = gpu_overlay[:,:,3].astype(cp.float32) / 255.0
-                                
-                                # Create the result array on GPU
-                                blended_gpu = cp.zeros_like(gpu_area)
-                                
-                                # Apply blending for each channel
-                                for c in range(3):
-                                    blended_gpu[:,:,c] = (gpu_area[:,:,c] * (1 - alpha_factor) + 
-                                                      gpu_overlay[:,:,c] * alpha_factor).astype(cp.uint8)
+                                # Use global alpha lookup table if available, or create on-demand
+                                if USE_ADVANCED_FEATURES:
+                                    # Access precomputed alpha values and complements
+                                    alpha_values = to_gpu(ALPHA_LUT)
+                                    alpha_complements = to_gpu(ALPHA_COMPLEMENT_LUT)
+                                    
+                                    # Get alpha indices (0-255)
+                                    alpha_indices = gpu_overlay[:,:,3]
+                                    
+                                    # Expand dimensions for broadcasting
+                                    alpha_factor = cp.take(alpha_values, alpha_indices).reshape(alpha_indices.shape[0], alpha_indices.shape[1], 1)
+                                    alpha_complement = cp.take(alpha_complements, alpha_indices).reshape(alpha_indices.shape[0], alpha_indices.shape[1], 1)
+                                    
+                                    # Apply blending with pre-computed alpha values
+                                    blended_gpu = (gpu_area * alpha_complement + 
+                                                  gpu_overlay[:,:,:3] * alpha_factor).astype(cp.uint8)
+                                else:
+                                    # Standard vectorized alpha blending (fallback)
+                                    alpha_factor = gpu_overlay[:,:,3].astype(cp.float32) / 255.0
+                                    alpha_factor = alpha_factor[:,:,cp.newaxis]  # Add channel dimension for broadcasting
+                                    
+                                    # Vectorized alpha blending for all channels at once
+                                    blended_gpu = (gpu_area * (1 - alpha_factor) + 
+                                                  gpu_overlay[:,:,:3] * alpha_factor).astype(cp.uint8)
                                 
                                 # Transfer back to CPU
-                                blended_area = cp.asnumpy(blended_gpu)
+                                blended_area = to_cpu(blended_gpu)
                                 
                                 # Copy the blended result back to the portrait frame
                                 portrait_frame[y_pos:y_pos+h, x_pos:x_pos+w] = blended_area
